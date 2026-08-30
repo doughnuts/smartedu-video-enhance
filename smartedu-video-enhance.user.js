@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧教育·教师研修 视频增强（倍速/后台播放/拖进度条）
 // @namespace    https://github.com/doughnuts/smartedu-video-enhance
-// @version      1.8.0
+// @version      1.9.1
 // @description  国家智慧教育公共服务平台视频播放增强：倍速播放、后台播放、拖动进度条。仅供学习浏览器脚本技术，请遵守平台规则；使用产生的一切后果（含学时认定、账号处理）由使用者自行承担。
 // @author       LD(鸡蛋不放葱)
 // @license      MIT
@@ -36,6 +36,35 @@
 
 (function () {
   'use strict';
+
+  // ==================== 墙钟加速（时间膨胀 / Time Dilation） ====================
+  // 平台"每秒测速"公式：speed = currentTime增量 / Date.now()增量，且 playbackRate()>2 或 speed>2.2 就判违规。
+  // 旧版做法：把 currentTime 放慢到 2x 来压低 speed——代价是平台记录的学习进度也被放慢，
+  //          视频放完了平台却以为只看到一半，导致 >2 倍速时学时认定不完整。
+  // 新版做法：currentTime 按真实速度推进（进度/学时正常走到 100%），
+  //          同时把 Date.now 按 factor 加速，使平台测得的 speed 仍然 ≤2x。二者兼得。
+  var _realNow = Date.now;
+  var _tsScale = 1, _tsAnchorReal = _realNow(), _tsAnchorFake = _tsAnchorReal;
+
+  function _fakeNow() {
+    return _tsAnchorFake + (_realNow() - _tsAnchorReal) * _tsScale;
+  }
+  function setTimeScale(s) {
+    if (s === _tsScale) return;
+    if (s === 1) {
+      // 回到真实墙钟：直接对齐真实时间（此时视频已结束/暂停或已降到 ≤2x，时钟回跳无副作用）
+      _tsAnchorFake = _tsAnchorReal = _realNow();
+    } else {
+      // 开启/增大加速：以当前"假时间"为锚点，保证切换时单调连续、不向前跳变
+      _tsAnchorFake = _fakeNow();
+      _tsAnchorReal = _realNow();
+    }
+    _tsScale = s;
+  }
+  try { Date.now = _fakeNow; } catch (e) { }
+
+  // 脚本内部计时一律用真实墙钟，避免被上面的时间膨胀连带加速
+  function realNow() { return _realNow(); }
 
   var KEY = 'smSe_settings_v1';
   var TAG = '[研修视频增强]';
@@ -115,12 +144,13 @@
 
   /**
    * 核心思路：
-   *  - 平台每秒测速：读取 player.playbackRate() 和 currentTime 增量。
+   *  - 平台每秒测速：speed = currentTime 增量 / Date.now() 增量，且 playbackRate()>2 或 speed>2.2 就判违规。
    *  - 平台防拖拽：timeupdate 里发现 currentTime 相对上次跳变 >= 2 秒且超过"已看位置"就拉回。
    *  - 对策（shield 模式）：
    *      1) playbackRate 读取被伪装成 <= 2；
-   *      2) currentTime 读取按 factor=max(1,rate/2) 放慢，平台看到的"视频时间"最多以 2 倍速推进；
-   *      3) 拖进度条时把"伪装时间"做成连续的（不跳变），平台永远看不到跳变，也就不会拉回。
+   *      2) currentTime 按真实速度推进（factor=1），保证进度/学时正常走到 100%；
+   *      3) 同时把 Date.now 按 factor=rate/2 加速，使平台测得的 speed 恒为 2x（见顶部时间膨胀）；
+   *      4) 拖进度条时把"伪装时间"做成连续的（不跳变），平台永远看不到跳变，也就不会拉回。
    *  关闭 shield 时一切还原为平台原生行为（原生 2x 倍速、允许范围内拖拽不受影响）。
    */
   function hookVideo(video) {
@@ -129,7 +159,7 @@
     // 只保存伪装状态，不再覆盖 video.currentTime / video.playbackRate 元素属性。
     // 原因：HLS 播放器内部读的是元素属性来定位/缓冲，若把元素伪装了，拖动到未缓冲位置会一直转圈。
     // 伪装改在 player.currentTime() / player.playbackRate() 方法层做（平台检测读的正是这些方法）。
-    video.__smSeSt = { shield: false, base: 0, baseReal: 0, factor: 1 };
+    video.__smSeSt = { shield: false, base: 0, baseReal: 0, factor: 1, lastBackAt: 0 };
   }
 
   // 时间写入的统一映射（供 seekTo 和 player.currentTime 写入时调用）：
@@ -200,6 +230,18 @@
           if (!st.shield) return real;
           return st.base + (real - st.baseReal) / st.factor;
         }
+        // 高倍速兜底：拦截平台防拖拽的"连续回拉"（向后设置且两次间隔极短）。
+        // 单次向后 seek（答题卡点回跳、续播起点）不受影响；只有 400ms 内连续回退才判定为误判，
+        // 此时只更新伪装映射、不真正倒退真实时间，避免进度被反复拉回卡死、提交不上。
+        if (st.shield && state.rate > 4 && seconds < getRealTime(video) - 0.5) {
+          var backNow = realNow();
+          if (backNow - (st.lastBackAt || 0) < 400) {
+            st.base = seconds;
+            st.baseReal = seconds;
+            return;
+          }
+          st.lastBackAt = backNow;
+        }
         applyTimeSet(video, seconds);
         return origTime(seconds);
       };
@@ -223,20 +265,22 @@
     if (on) {
       st.base = real;
       st.baseReal = real;
-      st.factor = Math.max(1, state.rate / 2);
+      st.factor = 1; // 不再放慢 currentTime：进度/学时按真实倍速推进
     } else {
       st.base = 0; st.baseReal = 0; st.factor = 1;
     }
+    applyTimeScale();
   }
 
-  // 倍速变化时重算 factor，保持伪装时间连续
+  // 倍速变化时重算映射（factor 恒为 1，这里只做连续重锚定），保持伪装时间连续
   function updateFactor(video) {
     var st = video.__smSeSt;
     if (!st || !st.shield) return;
     var real = getRealTime(video);
-    st.base = st.base + (real - st.baseReal) / st.factor; // 当前伪装值
+    st.base = st.base + (real - st.baseReal) / st.factor; // 当前伪装值（factor=1 即真实值）
     st.baseReal = real;
-    st.factor = Math.max(1, state.rate / 2);
+    st.factor = 1;
+    applyTimeScale();
   }
 
   function syncShield(video) {
@@ -245,6 +289,16 @@
     // 注意：只在开关切换时重校准。切勿周期调用 updateFactor——
     // 那样会把伪装时间"瞬间对齐"回真实时间，恰好制造平台检测所需的跳变（会被回拉/报倍速）。
     if (st.shield !== state.shield) enableShield(video, state.shield);
+    applyTimeScale();
+  }
+
+  // 依据当前状态与视频播放情况，决定 Date.now 需要加速多少倍：
+  //   超速模式(rate>2)且视频正在播放 → 按 rate/2 加速，让平台测速恒为 2x；
+  //   其余情况 → 还原为 1（不加速），避免影响页面其它功能。
+  function applyTimeScale() {
+    var v = getActiveVideo();
+    var dilate = state.shield && state.rate > 2 && v && !v.ended;
+    setTimeScale(dilate ? state.rate / 2 : 1);
   }
 
   // ==================== 视频发现 ====================
@@ -326,7 +380,7 @@
             var t = (btns[k].textContent || '').trim();
             if (/^(确定|知道了|关闭|好的|继续|OK|ok)$/i.test(t)) {
               btns[k].click();
-              autoResumeUntil = Date.now() + 3000;
+              autoResumeUntil = realNow() + 3000;
               return true;
             }
           }
@@ -353,6 +407,7 @@
       setRate(video, v);
       if (video.__smSeSt && state.shield) updateFactor(video);
     }
+    applyTimeScale();
     refreshPanel();
   }
 
@@ -362,7 +417,7 @@
     if (!isFinite(dur) || dur <= 0) { toast('无法获取时长（可能是直播）'); return; }
     t = Math.max(0, Math.min(t, dur - 0.5));
     var forward = t >= getRealTime(video) - 0.5;
-    seekReq = { video: video, target: t, at: Date.now(), retries: 0, reverted: false, forward: forward };
+    seekReq = { video: video, target: t, at: realNow(), retries: 0, reverted: false, forward: forward };
     applyTimeSet(video, t);   // 先映射伪装时间
     setRealTime(video, t);    // 再设元素真实时间（HLS 靠真实值定位缓冲）
   }
@@ -373,6 +428,7 @@
   function watchdog() {
     // 强制一致性：超过 2 倍速必须开启 shield
     if (state.rate > 2 && !state.shield) { state.shield = true; saveSettings(); }
+    applyTimeScale();
 
     var video = getActiveVideo();
     if (video) {
@@ -394,10 +450,10 @@
         // 成功：未发生回拉、且已到达/越过目标位置（含落地后正常前进）
         if (!seekReq.reverted && rt >= seekReq.target - 1) {
           seekReq = null;
-        } else if (Date.now() - seekReq.at > 1200 && !dragging) {
+        } else if (realNow() - seekReq.at > 1200 && !dragging) {
           if (seekReq.retries < 4) {
             var wasReverted = seekReq.reverted;
-            seekReq.retries++; seekReq.at = Date.now(); seekReq.reverted = false;
+            seekReq.retries++; seekReq.at = realNow(); seekReq.reverted = false;
             if (wasReverted && !state.shield) {
               state.shield = true; saveSettings();
               toast('平台把进度拉回去了，已自动开启【解锁模式】并重试');
@@ -413,7 +469,7 @@
 
       // 后台播放兜底：被暂停且真的切走了标签页时自动续播
       if (state.bg && video.paused && !video.ended) {
-        var needResume = isReallyHidden() || Date.now() < autoResumeUntil;
+        var needResume = isReallyHidden() || realNow() < autoResumeUntil;
         if (needResume && !modalVisible()) {
           try { video.play().catch(function () { }); } catch (e) { }
         }
@@ -431,7 +487,7 @@
 
       // 2) 防"卡顿回退"：网络缓冲慢导致卡顿后，播放器把时间往后跳，自动拉回
       if (!seekReq && !dragging && !video.ended && video.__smStallAt &&
-          (Date.now() - video.__smStallAt) < 15000 &&
+          (realNow() - video.__smStallAt) < 15000 &&
           typeof video.__smStallPos === 'number' && (video.__smStallPos - curReal) > 2) {
         seekTo(video, video.__smStallPos);
         toast('检测到卡顿回退，已恢复进度');
@@ -477,7 +533,7 @@
         });
         // 记录卡顿（缓冲跟不上）时的位置，用于"卡顿回退"后自动恢复
         v.addEventListener('waiting', function () {
-          v.__smStallAt = Date.now();
+          v.__smStallAt = realNow();
           v.__smStallPos = getRealTime(v);
         });
         try { v.preload = 'auto'; } catch (e) { }
@@ -654,7 +710,7 @@
     var hint = document.getElementById('smSe-hint');
     if (hint) {
       hint.innerHTML = state.shield
-        ? '<b style="color:#e6a23c;">⚠ 超速模式：</b>超过 2 倍速时，平台严格防刷校验可能<b style="color:#f56c6c;">不认定学习进度与学时</b>。如需正常认定学时，点上面「认定模式(2x)」。'
+        ? '<b style="color:#e6a23c;">⚠ 超速模式：</b>已做「墙钟加速」补偿，学习进度与学时按<b>真实倍速</b>推进、可正常认定；请遵守平台规则，风险自担。'
         : '✅ 认定安全：2x 及以内平台正常记录学习进度与学时。';
     }
   }
@@ -759,6 +815,19 @@
       var v = getActiveVideo();
       if (v) hookPlayer(v);
     }, 250);
+
+    // 高频 timeupdate 脉冲：8x/16x 时，平台防拖拽逻辑按"两次 timeupdate 之间 currentTime 前进 ≥2s"判定拖拽并回拉。
+    // 原生 timeupdate 约 4Hz（250ms），16x 下一次前进 4s 会被误判，导致进度被反复拉回、卡住、提交不上。
+    // 主动以更高频率触发 timeupdate，让每次增量 <2s，防拖拽就不会误触发，进度即可正常走到 100%。
+    setInterval(function () {
+      if (!state.shield || state.rate <= 4) return;
+      var video = getActiveVideo();
+      if (!video || video.paused || video.ended) return;
+      var p = findPlayer(video);
+      if (p && typeof p.trigger === 'function') {
+        try { p.trigger('timeupdate'); } catch (e) { }
+      }
+    }, 100);
 
     try {
       if (typeof GM_registerMenuCommand === 'function') {
