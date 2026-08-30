@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧教育·教师研修 视频增强（倍速/后台播放/拖进度条）
 // @namespace    https://github.com/doughnuts/smartedu-video-enhance
-// @version      1.7.0
+// @version      1.8.0
 // @description  国家智慧教育公共服务平台视频播放增强：倍速播放、后台播放、拖动进度条。仅供学习浏览器脚本技术，请遵守平台规则；使用产生的一切后果（含学时认定、账号处理）由使用者自行承担。
 // @author       LD(鸡蛋不放葱)
 // @license      MIT
@@ -529,6 +529,9 @@
       '<button data-rate="4">4x</button><button data-rate="8">8x</button>' +
       '<button data-rate="16">16x</button>' +
       '</div>' +
+      '<div class="smSe-row"><span class="smSe-label">学时</span>' +
+      '<button id="smSe-safe" style="border-color:#e6a23c;color:#e6a23c;">认定模式(2x)</button>' +
+      '</div>' +
       '<div class="smSe-row smSe-toggles">' +
       '<label class="smSe-switch"><input type="checkbox" id="smSe-bg"> 后台播放</label>' +
       '<label class="smSe-switch"><input type="checkbox" id="smSe-shield"> 超速/解锁模式</label>' +
@@ -537,7 +540,7 @@
       '<div class="smSe-bar" id="smSe-bar"><div class="smSe-buffered" id="smSe-buffered"></div><div class="smSe-played" id="smSe-played"></div></div>' +
       '<div class="smSe-time"><span id="smSe-cur">0:00</span> / <span id="smSe-dur">0:00</span></div>' +
       '</div>' +
-      '<div class="smSe-hint">提示：超速/解锁模式下，平台记录的学习进度会按最高 2 倍速推进。</div>' +
+      '<div class="smSe-hint" id="smSe-hint"></div>' +
       '</div>';
     document.documentElement.appendChild(panel);
 
@@ -557,6 +560,15 @@
 
     document.getElementById('smSe-mini').addEventListener('click', function () {
       state.mini = !state.mini; saveSettings(); refreshPanel();
+    });
+
+    // 学时认定模式：一键回到 2x + 关闭超速，确保平台正常认定学时
+    document.getElementById('smSe-safe').addEventListener('click', function () {
+      state.shield = false; saveSettings();
+      var v = getActiveVideo();
+      if (v) syncShield(v);
+      applyRate(2);
+      toast('已切换到「认定模式」：2x 倍速，平台可正常认定学习进度与学时');
     });
 
     document.getElementById('smSe-bg').addEventListener('change', function (e) {
@@ -639,6 +651,12 @@
     if (body) body.style.display = state.mini ? 'none' : 'block';
     var mini = document.getElementById('smSe-mini');
     if (mini) mini.textContent = state.mini ? '＋' : '—';
+    var hint = document.getElementById('smSe-hint');
+    if (hint) {
+      hint.innerHTML = state.shield
+        ? '<b style="color:#e6a23c;">⚠ 超速模式：</b>超过 2 倍速时，平台严格防刷校验可能<b style="color:#f56c6c;">不认定学习进度与学时</b>。如需正常认定学时，点上面「认定模式(2x)」。'
+        : '✅ 认定安全：2x 及以内平台正常记录学习进度与学时。';
+    }
   }
 
   function shouldBuildPanel() {
