@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧教育·教师研修 视频增强（倍速/后台播放/拖进度条）
 // @namespace    https://github.com/doughnuts/smartedu-video-enhance
-// @version      1.6.0
+// @version      1.7.0
 // @description  国家智慧教育公共服务平台视频播放增强：倍速播放、后台播放、拖动进度条。仅供学习浏览器脚本技术，请遵守平台规则；使用产生的一切后果（含学时认定、账号处理）由使用者自行承担。
 // @author       LD(鸡蛋不放葱)
 // @license      MIT
@@ -126,45 +126,30 @@
   function hookVideo(video) {
     if (video.__smSeHooked) return;
     video.__smSeHooked = true;
-    var st = { shield: false, base: 0, baseReal: 0, factor: 1 };
-    video.__smSeSt = st;
-    try {
-      Object.defineProperty(video, 'currentTime', {
-        configurable: true,
-        get: function () {
-          var real = getRealTime(video);
-          if (!st.shield) return real;
-          return st.base + (real - st.baseReal) / st.factor;
-        },
-        set: function (v) {
-          // 按方向区分处理：
-          //  1) 向前跳（用户拖拽）：伪装时间保持连续，平台看不到跳变，防拖拽逻辑不触发；
-          //  2) 向后跳（平台回拉 / 用户回拖 / 播完重置）：伪装时间跟随真实值——
-          //     平台回拉后若伪装值仍停在前面，页面层 seeking 处理器会反复回拉造成死循环。
-          var real = getRealTime(video);
-          // 检测"平台把进度拉回去"：我们刚向前拖拽后，时间被往回大幅设置（>1.5s）
-          if (seekReq && seekReq.video === video && seekReq.forward && !seekReq.reverted && v < real - 1.5) {
-            seekReq.reverted = true;
-          }
-          if (st.shield && v >= real - 0.05) {
-            st.base = st.base + (real - st.baseReal) / st.factor; // 当前伪装值
-            st.baseReal = v;
-          } else {
-            st.base = v;
-            st.baseReal = v;
-          }
-          setRealTime(video, v);
-        }
-      });
-      Object.defineProperty(video, 'playbackRate', {
-        configurable: true,
-        get: function () {
-          var real = getRealRate(video);
-          return st.shield ? Math.min(real, 2) : real;
-        },
-        set: function (v) { setRealRate(video, v); }
-      });
-    } catch (e) { console.warn(TAG, 'video hook fail', e); }
+    // 只保存伪装状态，不再覆盖 video.currentTime / video.playbackRate 元素属性。
+    // 原因：HLS 播放器内部读的是元素属性来定位/缓冲，若把元素伪装了，拖动到未缓冲位置会一直转圈。
+    // 伪装改在 player.currentTime() / player.playbackRate() 方法层做（平台检测读的正是这些方法）。
+    video.__smSeSt = { shield: false, base: 0, baseReal: 0, factor: 1 };
+  }
+
+  // 时间写入的统一映射（供 seekTo 和 player.currentTime 写入时调用）：
+  //  前跳 → 伪装时间保持连续（平台看不到跳变，防拖拽不触发）；
+  //  后跳 → 伪装时间跟随真实值（避免页面层 seeking 处理器反复回拉死循环）；
+  //  同时检测"平台把进度拉回去"（前跳后被往回大幅设置 >1.5s）。
+  function applyTimeSet(video, v) {
+    var st = video.__smSeSt;
+    if (!st) return;
+    var real = getRealTime(video);
+    if (seekReq && seekReq.video === video && seekReq.forward && !seekReq.reverted && v < real - 1.5) {
+      seekReq.reverted = true;
+    }
+    if (st.shield && v >= real - 0.05) {
+      st.base = st.base + (real - st.baseReal) / st.factor;
+      st.baseReal = v;
+    } else {
+      st.base = v;
+      st.baseReal = v;
+    }
   }
 
   // 找到真正的 video.js 播放器实例。
@@ -189,22 +174,34 @@
     return null;
   }
 
-  // 包一层 video.js 播放器的 playbackRate 方法。
-  // 平台检测读的是 player.playbackRate()，其内部走 cache 会绕过 video 元素上的属性伪装，
-  // 因此必须单独包住，否则超过 2 倍速会被检测到并弹窗/重置进度。
+  // 包一层 video.js 播放器方法：
+  //  1) playbackRate() —— 平台倍速检测读这个，内部走 cache 会绕过元素属性，必须单独包；
+  //  2) currentTime() —— 平台测速/防拖拽读的都是这个方法，伪装放在这里，元素属性保持真实。
   function hookPlayer(video) {
+    hookVideo(video); // 确保状态已初始化（快速轮询可能先于 hookVideo 触发）
     var p = findPlayer(video);
     if (!p || p.__smSeHooked) return;
     p.__smSeHooked = true;
+    var st = video.__smSeSt;
     try {
-      var orig = p.playbackRate.bind(p);
+      var origRate = p.playbackRate.bind(p);
       p.playbackRate = function (v) {
         if (v === undefined) {
-          var st = video.__smSeSt;
           var real = getRealRate(video); // 直接读元素真实倍速，避免 cache 泄露真实值
-          return st && st.shield ? Math.min(real, 2) : real;
+          return st.shield ? Math.min(real, 2) : real;
         }
-        return orig(v);
+        return origRate(v);
+      };
+
+      var origTime = p.currentTime.bind(p);
+      p.currentTime = function (seconds) {
+        if (seconds === undefined) {
+          var real = getRealTime(video);
+          if (!st.shield) return real;
+          return st.base + (real - st.baseReal) / st.factor;
+        }
+        applyTimeSet(video, seconds);
+        return origTime(seconds);
       };
     } catch (e) { }
   }
@@ -366,7 +363,8 @@
     t = Math.max(0, Math.min(t, dur - 0.5));
     var forward = t >= getRealTime(video) - 0.5;
     seekReq = { video: video, target: t, at: Date.now(), retries: 0, reverted: false, forward: forward };
-    try { video.currentTime = t; } catch (e) { setRealTime(video, t); }
+    applyTimeSet(video, t);   // 先映射伪装时间
+    setRealTime(video, t);    // 再设元素真实时间（HLS 靠真实值定位缓冲）
   }
 
   var autoResumeUntil = 0;
@@ -404,7 +402,8 @@
               state.shield = true; saveSettings();
               toast('平台把进度拉回去了，已自动开启【解锁模式】并重试');
             }
-            try { video.currentTime = seekReq.target; } catch (e) { setRealTime(video, seekReq.target); }
+            applyTimeSet(video, seekReq.target);
+            setRealTime(video, seekReq.target);
           } else {
             toast('该位置被平台限制，无法跳转');
             seekReq = null;
@@ -426,8 +425,7 @@
 
       // 1) 防"进度被重置为0"：超速+解锁模式下时间突然掉回0（平台检测惩罚），恢复原位置
       if (state.shield && state.rate > 2 && !video.ended && !seekReq && lastGoodTime > 30 && curReal < 2) {
-        seekReq = { video: video, target: lastGoodTime, at: Date.now(), retries: 0, reverted: false, forward: true };
-        try { video.currentTime = lastGoodTime; } catch (e) { setRealTime(video, lastGoodTime); }
+        seekTo(video, lastGoodTime);
         toast('检测到进度被重置，已恢复');
       }
 
@@ -435,8 +433,7 @@
       if (!seekReq && !dragging && !video.ended && video.__smStallAt &&
           (Date.now() - video.__smStallAt) < 15000 &&
           typeof video.__smStallPos === 'number' && (video.__smStallPos - curReal) > 2) {
-        seekReq = { video: video, target: video.__smStallPos, at: Date.now(), retries: 0, reverted: false, forward: true };
-        try { video.currentTime = video.__smStallPos; } catch (e) { setRealTime(video, video.__smStallPos); }
+        seekTo(video, video.__smStallPos);
         toast('检测到卡顿回退，已恢复进度');
         video.__smStallAt = 0;
       }
