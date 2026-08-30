@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧教育·教师研修 视频增强（倍速/后台播放/拖进度条）
 // @namespace    https://github.com/doughnuts/smartedu-video-enhance
-// @version      1.5.0
+// @version      1.6.0
 // @description  国家智慧教育公共服务平台视频播放增强：倍速播放、后台播放、拖动进度条。仅供学习浏览器脚本技术，请遵守平台规则；使用产生的一切后果（含学时认定、账号处理）由使用者自行承担。
 // @author       LD(鸡蛋不放葱)
 // @license      MIT
@@ -420,13 +420,25 @@
         }
       }
 
-      // 防"进度被重置为0"：超速+解锁模式下，若时间突然掉回 0 而此前已看很多，说明被平台重置，恢复原位置
+      // 记录最近一次正常播放位置（取最大值，用于对抗"回退/重置"）
       var curReal = getRealTime(video);
-      if (curReal > 1) lastGoodTime = curReal;
+      if (curReal > 1 && curReal > lastGoodTime) lastGoodTime = curReal;
+
+      // 1) 防"进度被重置为0"：超速+解锁模式下时间突然掉回0（平台检测惩罚），恢复原位置
       if (state.shield && state.rate > 2 && !video.ended && !seekReq && lastGoodTime > 30 && curReal < 2) {
         seekReq = { video: video, target: lastGoodTime, at: Date.now(), retries: 0, reverted: false, forward: true };
         try { video.currentTime = lastGoodTime; } catch (e) { setRealTime(video, lastGoodTime); }
         toast('检测到进度被重置，已恢复');
+      }
+
+      // 2) 防"卡顿回退"：网络缓冲慢导致卡顿后，播放器把时间往后跳，自动拉回
+      if (!seekReq && !dragging && !video.ended && video.__smStallAt &&
+          (Date.now() - video.__smStallAt) < 15000 &&
+          typeof video.__smStallPos === 'number' && (video.__smStallPos - curReal) > 2) {
+        seekReq = { video: video, target: video.__smStallPos, at: Date.now(), retries: 0, reverted: false, forward: true };
+        try { video.currentTime = video.__smStallPos; } catch (e) { setRealTime(video, video.__smStallPos); }
+        toast('检测到卡顿回退，已恢复进度');
+        video.__smStallAt = 0;
       }
 
       // 倍速警告弹窗兜底关闭（正常情况 shield 已避免触发）
@@ -466,6 +478,12 @@
         v.addEventListener('timeupdate', function () {
           if (v === getActiveVideo()) updatePanelTime(v);
         });
+        // 记录卡顿（缓冲跟不上）时的位置，用于"卡顿回退"后自动恢复
+        v.addEventListener('waiting', function () {
+          v.__smStallAt = Date.now();
+          v.__smStallPos = getRealTime(v);
+        });
+        try { v.preload = 'auto'; } catch (e) { }
       }
       // shield 状态同步到所有视频（仅激活视频真正生效，其余只跟随 state 变化）
       if (vids[i] === getActiveVideo()) syncShield(vids[i]);
