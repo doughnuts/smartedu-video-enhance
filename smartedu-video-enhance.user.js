@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧教育·教师研修 视频增强（倍速/后台播放/拖进度条）
 // @namespace    https://github.com/doughnuts/smartedu-video-enhance
-// @version      1.2.0
+// @version      1.4.0
 // @description  国家智慧教育公共服务平台视频播放增强：倍速播放、后台播放、拖动进度条。仅供学习浏览器脚本技术，请遵守平台规则；使用产生的一切后果（含学时认定、账号处理）由使用者自行承担。
 // @author       LD(鸡蛋不放葱)
 // @license      MIT
@@ -142,6 +142,10 @@
           //  2) 向后跳（平台回拉 / 用户回拖 / 播完重置）：伪装时间跟随真实值——
           //     平台回拉后若伪装值仍停在前面，页面层 seeking 处理器会反复回拉造成死循环。
           var real = getRealTime(video);
+          // 检测"平台把进度拉回去"：我们刚向前拖拽后，时间被往回大幅设置（>1.5s）
+          if (seekReq && seekReq.video === video && seekReq.forward && !seekReq.reverted && v < real - 1.5) {
+            seekReq.reverted = true;
+          }
           if (st.shield && v >= real - 0.05) {
             st.base = st.base + (real - st.baseReal) / st.factor; // 当前伪装值
             st.baseReal = v;
@@ -163,22 +167,55 @@
     } catch (e) { console.warn(TAG, 'video hook fail', e); }
   }
 
-  // 包一层 video.js 播放器方法，页面拿到的 playbackRate() 同样被伪装
+  // 找到真正的 video.js 播放器实例。
+  // 关键：真实页里播放器实例挂在 .video-js 容器元素的 .player 属性上，
+  // 而 <video class="vjs-tech"> 元素本身的 .player 是 undefined（或指向 tech）。
+  function findPlayer(video) {
+    if (video.player) return video.player;
+    try {
+      var el = video.closest && video.closest('.video-js');
+      if (el && el.player) return el.player;
+    } catch (e) { }
+    try {
+      var vjs = window.videojs;
+      if (vjs && vjs.getPlayers) {
+        var players = vjs.getPlayers();
+        for (var k in players) {
+          var p = players[k];
+          if (p && p.el_ && (p.el_ === video || (p.el_.contains && p.el_.contains(video)))) return p;
+        }
+      }
+    } catch (e) { }
+    return null;
+  }
+
+  // 包一层 video.js 播放器的 playbackRate 方法。
+  // 平台检测读的是 player.playbackRate()，其内部走 cache 会绕过 video 元素上的属性伪装，
+  // 因此必须单独包住，否则超过 2 倍速会被检测到并弹窗/重置进度。
   function hookPlayer(video) {
-    var p = video.player;
+    var p = findPlayer(video);
     if (!p || p.__smSeHooked) return;
     p.__smSeHooked = true;
     try {
       var orig = p.playbackRate.bind(p);
       p.playbackRate = function (v) {
-        var st = video.__smSeSt;
         if (v === undefined) {
-          var real = orig();
-          return st.shield ? Math.min(real, 2) : real;
+          var st = video.__smSeSt;
+          var real = getRealRate(video); // 直接读元素真实倍速，避免 cache 泄露真实值
+          return st && st.shield ? Math.min(real, 2) : real;
         }
         return orig(v);
       };
     } catch (e) { }
+  }
+
+  // 统一设置倍速：优先走播放器方法（同步 video.js 内部 cache），否则直接设元素
+  function setRate(video, r) {
+    var p = findPlayer(video);
+    if (p && typeof p.playbackRate === 'function') {
+      try { p.playbackRate(r); return; } catch (e) { }
+    }
+    setRealRate(video, r);
   }
 
   function enableShield(video, on) {
@@ -316,10 +353,7 @@
       var video = vids[i];
       hookVideo(video); hookPlayer(video);
       if (video.__smSeSt) syncShield(video); // 立即生效，避免检测窗口期
-      try {
-        if (video.player && video.player.playbackRate) video.player.playbackRate(v);
-        else setRealRate(video, v);
-      } catch (e) { setRealRate(video, v); }
+      setRate(video, v);
       if (video.__smSeSt && state.shield) updateFactor(video);
     }
     refreshPanel();
@@ -330,11 +364,13 @@
     var dur = video.duration;
     if (!isFinite(dur) || dur <= 0) { toast('无法获取时长（可能是直播）'); return; }
     t = Math.max(0, Math.min(t, dur - 0.5));
-    seekReq = { video: video, target: t, at: Date.now(), retries: 0 };
+    var forward = t >= getRealTime(video) - 0.5;
+    seekReq = { video: video, target: t, at: Date.now(), retries: 0, reverted: false, forward: forward };
     try { video.currentTime = t; } catch (e) { setRealTime(video, t); }
   }
 
   var autoResumeUntil = 0;
+  var lastGoodTime = 0; // 记录最近一次正常的播放位置，用于对抗平台"进度被重置为0"
 
   function watchdog() {
     // 强制一致性：超过 2 倍速必须开启 shield
@@ -350,23 +386,21 @@
       if (state.rate !== 1 && !video.ended) {
         var real = getRealRate(video);
         if (Math.abs(real - state.rate) > 0.05) {
-          try {
-            if (video.player && video.player.playbackRate) video.player.playbackRate(state.rate);
-            else setRealRate(video, state.rate);
-          } catch (e) { setRealRate(video, state.rate); }
+          setRate(video, state.rate);
         }
       }
 
       // 拖拽被平台拉回 → 自动开启解锁模式重试
       if (seekReq && seekReq.video === video) {
         var rt = getRealTime(video);
-        // 已落到目标位置（或播放已越过目标）即视为成功；被拉回时 real 会一直停在旧位置
-        if (rt >= seekReq.target - 0.5) {
+        // 成功：未发生回拉、且已到达/越过目标位置（含落地后正常前进）
+        if (!seekReq.reverted && rt >= seekReq.target - 1) {
           seekReq = null;
-        } else if (Date.now() - seekReq.at > 1500 && !dragging) {
+        } else if (Date.now() - seekReq.at > 1200 && !dragging) {
           if (seekReq.retries < 4) {
-            seekReq.retries++; seekReq.at = Date.now();
-            if (!state.shield) {
+            var wasReverted = seekReq.reverted;
+            seekReq.retries++; seekReq.at = Date.now(); seekReq.reverted = false;
+            if (wasReverted && !state.shield) {
               state.shield = true; saveSettings();
               toast('平台把进度拉回去了，已自动开启【解锁模式】并重试');
             }
@@ -384,6 +418,15 @@
         if (needResume && !modalVisible()) {
           try { video.play().catch(function () { }); } catch (e) { }
         }
+      }
+
+      // 防"进度被重置为0"：超速+解锁模式下，若时间突然掉回 0 而此前已看很多，说明被平台重置，恢复原位置
+      var curReal = getRealTime(video);
+      if (curReal > 1) lastGoodTime = curReal;
+      if (state.shield && state.rate > 2 && !video.ended && !seekReq && lastGoodTime > 30 && curReal < 2) {
+        seekReq = { video: video, target: lastGoodTime, at: Date.now(), retries: 0, reverted: false, forward: true };
+        try { video.currentTime = lastGoodTime; } catch (e) { setRealTime(video, lastGoodTime); }
+        toast('检测到进度被重置，已恢复');
       }
 
       // 倍速警告弹窗兜底关闭（正常情况 shield 已避免触发）
@@ -405,17 +448,11 @@
         // 新视频套用当前倍速
         var v = vids[i];
         if (state.rate !== 1) {
-          try {
-            if (v.player && v.player.playbackRate) v.player.playbackRate(state.rate);
-            else setRealRate(v, state.rate);
-          } catch (e) { }
+          setRate(v, state.rate);
         }
         v.addEventListener('loadedmetadata', function () {
           if (state.rate !== 1) {
-            try {
-              if (v.player && v.player.playbackRate) v.player.playbackRate(state.rate);
-              else setRealRate(v, state.rate);
-            } catch (e) { }
+            setRate(v, state.rate);
           }
           syncShield(v);
         });
@@ -650,6 +687,12 @@
       tryBuild();
       refreshPanel();
     }, 1000);
+
+    // 快速轮询：尽早包住 video.js 播放器方法，避免平台检测在第一秒内读到真实倍速
+    setInterval(function () {
+      var v = getActiveVideo();
+      if (v) hookPlayer(v);
+    }, 250);
 
     try {
       if (typeof GM_registerMenuCommand === 'function') {
