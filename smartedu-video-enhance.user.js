@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         智慧教育·教师研修 视频增强（倍速/后台播放/拖进度条）
 // @namespace    https://github.com/doughnuts/smartedu-video-enhance
-// @version      1.4.0
+// @version      1.5.0
 // @description  国家智慧教育公共服务平台视频播放增强：倍速播放、后台播放、拖动进度条。仅供学习浏览器脚本技术，请遵守平台规则；使用产生的一切后果（含学时认定、账号处理）由使用者自行承担。
 // @author       LD(鸡蛋不放葱)
 // @license      MIT
@@ -672,6 +672,38 @@
     }
   }
 
+  // 超速模式下隐藏原生播放器进度条/时间显示（它们读的是"放慢后的时间"，会和小面板不同步），
+  // 只保留小面板这根真实进度条，避免"两根条速度不一致"的错觉。
+  var HIDE_NATIVE_BAR_CSS =
+    '.video-js .vjs-progress-control,' +
+    '.video-js .vjs-current-time,' +
+    '.video-js .vjs-time-divider,' +
+    '.video-js .vjs-duration,' +
+    '.video-js .vjs-remaining-time{display:none !important;}';
+
+  function syncNativeBarHide() {
+    try {
+      var roots = [document];
+      var micros = document.querySelectorAll('micro-app');
+      for (var i = 0; i < micros.length; i++) {
+        if (micros[i].shadowRoot) roots.push(micros[i].shadowRoot);
+      }
+      for (var j = 0; j < roots.length; j++) {
+        var r = roots[j];
+        var existing = r.querySelector && r.querySelector('#smSe-native-hide');
+        if (state.shield && !existing) {
+          var st = document.createElement('style');
+          st.id = 'smSe-native-hide';
+          st.textContent = HIDE_NATIVE_BAR_CSS;
+          if (r === document) { (document.head || document.documentElement).appendChild(st); }
+          else { r.appendChild(st); }
+        } else if (!state.shield && existing) {
+          existing.remove();
+        }
+      }
+    } catch (e) { }
+  }
+
   // ==================== 启动 ====================
   function boot() {
     injectCss();
@@ -685,6 +717,7 @@
     setInterval(function () {
       watchdog();
       tryBuild();
+      syncNativeBarHide();
       refreshPanel();
     }, 1000);
 
